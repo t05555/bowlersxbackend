@@ -11,10 +11,13 @@ import { requireAdmin } from './auth.js';
 
 const app = express();
 const isProduction = process.env.NODE_ENV === 'production';
-const allowedOrigins = (process.env.CORS_ORIGIN || '').split(',').map((origin) => origin.trim()).filter(Boolean);
+const allowedOrigins = [
+  ...(process.env.CORS_ORIGIN || '').split(',').map((origin) => origin.trim()).filter(Boolean),
+  'https://bowlersx.vercel.app',
+];
 app.use(cors({
   origin(origin, callback) {
-    callback(null, !origin || allowedOrigins.length === 0 || allowedOrigins.includes(origin));
+    callback(null, !origin || allowedOrigins.includes(origin));
   },
 }));
 app.use(express.json({ limit: '1mb' }));
