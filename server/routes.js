@@ -17,11 +17,12 @@ import { z } from 'zod';
 
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 5 * 1024 * 1024 } });
 const slugify = (value) => String(value || '').toLowerCase().trim().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '');
-const booleans = ['published', 'featured', 'newArrival', 'bestSeller', 'inStock', 'active'];
+const booleans = ['published', 'featured', 'newArrival', 'bestSeller', 'inStock', 'active', 'sale'];
 
 const productUpdateSchema = z.object({
   name: z.string().trim().min(2).optional(),
   price: z.coerce.number().nonnegative().optional(),
+  compareAtPrice: z.coerce.number().nonnegative().nullable().optional(),
   stock: z.coerce.number().int().nonnegative().optional(),
   sku: z.string().trim().optional(),
   description: z.string().optional(),
@@ -29,6 +30,7 @@ const productUpdateSchema = z.object({
   featured: z.boolean().optional(),
   newArrival: z.boolean().optional(),
   bestSeller: z.boolean().optional(),
+  sale: z.boolean().optional(),
   availability: z.enum(['in_stock', 'low_stock', 'out_of_stock', 'preorder']).optional(),
   displayOrder: z.coerce.number().optional(),
   newArrivalUntil: z.coerce.date().nullable().optional(),
@@ -39,9 +41,12 @@ function normalizeBody(body = {}) {
   booleans.forEach((key) => {
     if (key in data) data[key] = data[key] === true || data[key] === 'true' || data[key] === '1';
   });
-  ['price', 'compareAtPrice', 'stock', 'displayOrder', 'sortOrder'].forEach((key) => {
+  ['price', 'stock', 'displayOrder', 'sortOrder'].forEach((key) => {
     if (data[key] !== undefined && data[key] !== '') data[key] = Number(data[key]);
   });
+  if ('compareAtPrice' in data) {
+    data.compareAtPrice = data.compareAtPrice === '' || data.compareAtPrice === null || data.compareAtPrice === undefined ? null : Number(data.compareAtPrice);
+  }
   if (typeof data.weightOptions === 'string') {
     data.weightOptions = data.weightOptions.split(',').map((value) => value.trim()).filter(Boolean);
   }
@@ -205,6 +210,7 @@ export function registerRoutes(app) {
       if (!data.stock) data.stock = 0;
       data.availability = data.stock === 0 ? 'out_of_stock' : data.availability || 'in_stock';
       data.inStock = data.stock > 0;
+      if (data.sale && data.compareAtPrice != null && data.compareAtPrice <= data.price) data.sale = false;
       const uploaded = [];
       for (let index = 0; index < (req.files || []).length; index++) {
         if (!isR2Configured()) throw new Error('Cloudflare R2 is not configured');
@@ -230,6 +236,9 @@ export function registerRoutes(app) {
         data.availability = data.stock === 0 ? 'out_of_stock' : data.availability || existing.availability;
         data.inStock = data.stock > 0;
       }
+      const effectivePrice = data.price ?? existing.price;
+      const effectiveCompare = 'compareAtPrice' in data ? data.compareAtPrice : existing.compareAtPrice;
+      if ((data.sale ?? existing.sale) && effectiveCompare != null && effectiveCompare <= effectivePrice) data.sale = false;
       if (req.body.existingImages) {
         try {
           data.images = JSON.parse(req.body.existingImages);
