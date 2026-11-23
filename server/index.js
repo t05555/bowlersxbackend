@@ -76,7 +76,7 @@ app.post('/api/orders', async (req, res, next) => {
       email: String(body.email).trim().slice(0, 200),
       phone: String(body.phone || '').trim().slice(0, 50),
       shippingAddress: body.shippingAddress,
-      paymentMethod: body.paymentMethod === 'paypal' ? 'paypal' : 'card',
+      paymentMethod: 'manual',
       items,
       total,
       status: 'Processing',
