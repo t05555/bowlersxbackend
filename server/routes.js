@@ -1,5 +1,6 @@
 import multer from 'multer';
 import jwt from 'jsonwebtoken';
+import mongoose from 'mongoose';
 import Brand from './models/Brand.js';
 import Category from './models/Category.js';
 import Customer from './models/Customer.js';
@@ -59,15 +60,21 @@ function normalizeBody(body = {}) {
 
 async function resolveNames(data) {
   if (data.brand) {
-    const brand = await Brand.findById(data.brand).lean();
+    const brand = mongoose.isValidObjectId(data.brand)
+      ? await Brand.findById(data.brand).lean()
+      : await Brand.findOne({ name: data.brand }).lean();
     if (brand) data.brandName = brand.name;
   }
   if (data.category) {
-    const category = await Category.findById(data.category).lean();
+    const category = mongoose.isValidObjectId(data.category)
+      ? await Category.findById(data.category).lean()
+      : await Category.findOne({ name: data.category }).lean();
     if (category) data.categoryName = category.name;
   }
   if (data.subcategory) {
-    const subcategory = await Category.findById(data.subcategory).lean();
+    const subcategory = mongoose.isValidObjectId(data.subcategory)
+      ? await Category.findById(data.subcategory).lean()
+      : await Category.findOne({ name: data.subcategory }).lean();
     if (subcategory) data.subcategoryName = subcategory.name;
   }
 }
@@ -149,7 +156,8 @@ export function registerRoutes(app) {
       ]);
       const startToday = new Date(); startToday.setHours(0, 0, 0, 0);
       const startSevenDays = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000);
-      const [revenueResult, sales, visitsToday, visitsSevenDays, uniqueSevenDays, trafficByDay] = await Promise.all([
+      const startMonth = new Date(); startMonth.setDate(1); startMonth.setHours(0, 0, 0, 0);
+      const [revenueResult, sales, visitsToday, visitsSevenDays, visitsMonth, uniqueSevenDays, trafficByDay, orderStatusCounts] = await Promise.all([
         Order.aggregate([{ $group: { _id: null, total: { $sum: '$total' } } }]),
         Order.aggregate([
           { $match: { createdAt: { $gte: startSevenDays } } },
@@ -158,6 +166,7 @@ export function registerRoutes(app) {
         ]),
         Visit.countDocuments({ createdAt: { $gte: startToday } }),
         Visit.countDocuments({ createdAt: { $gte: startSevenDays } }),
+        Visit.countDocuments({ createdAt: { $gte: startMonth } }),
         Visit.distinct('sessionId', { createdAt: { $gte: startSevenDays } }),
         Visit.aggregate([
           { $match: { createdAt: { $gte: startSevenDays } } },
@@ -165,8 +174,12 @@ export function registerRoutes(app) {
           { $sort: { _id: 1 } },
           { $project: { _id: 1, visits: 1, uniqueVisitors: { $size: '$uniqueSessions' } } },
         ]),
+        Order.aggregate([
+          { $match: { createdAt: { $gte: startMonth } } },
+          { $group: { _id: '$status', count: { $sum: 1 } } },
+        ]),
       ]);
-      res.json({ productCount, publishedCount, orderCount, brandCount, categoryCount, lowStockCount, customerCount, revenue: revenueResult[0]?.total || 0, sales, visitsToday, visitsSevenDays, uniqueVisitorsSevenDays: uniqueSevenDays.length, trafficByDay });
+      res.json({ productCount, publishedCount, orderCount, brandCount, categoryCount, lowStockCount, customerCount, revenue: revenueResult[0]?.total || 0, sales, visitsToday, visitsSevenDays, visitsMonth, uniqueVisitorsSevenDays: uniqueSevenDays.length, trafficByDay, orderStatusCounts });
     } catch (error) { next(error); }
   });
 
