@@ -16,6 +16,12 @@ const orderSchema = new mongoose.Schema({
     price: { type: Number, required: true, min: 0 },
     weight: { type: String, default: '' },
   }],
+  chatTokenHash: { type: String, select: false },
+  messages: [{
+    sender: { type: String, enum: ['customer', 'admin'], required: true },
+    text: { type: String, required: true, trim: true, maxlength: 1000 },
+    createdAt: { type: Date, default: Date.now },
+  }],
   total: { type: Number, required: true, min: 0 },
   status: { type: String, enum: ['Processing', 'Shipped', 'Delivered', 'Cancelled'], default: 'Processing' },
 }, { timestamps: true });

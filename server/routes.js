@@ -11,6 +11,8 @@ import SiteSettings from './models/SiteSettings.js';
 import Visit from './models/Visit.js';
 import { requireAdmin } from './auth.js';
 import { isR2Configured, uploadToR2, deleteFromR2 } from './storage.js';
+import { normalizeOrderChatMessage } from './orderChat.js';
+import { normalizeWeightPrices } from './productInput.js';
 import { z } from 'zod';
 
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 5 * 1024 * 1024 } });
@@ -43,12 +45,7 @@ function normalizeBody(body = {}) {
   if (typeof data.weightOptions === 'string') {
     data.weightOptions = data.weightOptions.split(',').map((value) => value.trim()).filter(Boolean);
   }
-  if (typeof data.weightPrices === 'string') {
-    data.weightPrices = data.weightPrices.split(',').map((entry) => {
-      const [weight, price] = entry.split(':').map((value) => value.trim());
-      return weight && price ? { weight, price: Number(price) } : null;
-    }).filter((entry) => entry && Number.isFinite(entry.price));
-  }
+  if (data.weightPrices !== undefined) data.weightPrices = normalizeWeightPrices(data.weightPrices);
   ['newArrivalUntil'].forEach((key) => {
     if (data[key] === '' || data[key] === null) delete data[key];
   });
@@ -319,7 +316,38 @@ export function registerRoutes(app) {
     });
   }
 
-  app.get('/api/admin/orders', async (_req, res, next) => { try { res.json(await Order.find().sort({ createdAt: -1 }).lean()); } catch (error) { next(error); } });
+  app.get('/api/admin/orders', async (_req, res, next) => {
+    try {
+      const orders = await Order.find().sort({ createdAt: -1 }).lean();
+      res.json(orders.map(({ messages = [], ...order }) => ({
+        ...order,
+        chatMessageCount: messages.length,
+        latestMessage: messages.at(-1) || null,
+      })));
+    } catch (error) { next(error); }
+  });
+  app.get('/api/admin/orders/:id/messages', async (req, res, next) => {
+    try {
+      if (!mongoose.isValidObjectId(req.params.id)) return res.status(404).json({ error: 'Order not found' });
+      const order = await Order.findById(req.params.id).select('messages').lean();
+      if (!order) return res.status(404).json({ error: 'Order not found' });
+      res.json({ messages: order.messages || [] });
+    } catch (error) { next(error); }
+  });
+  app.post('/api/admin/orders/:id/messages', async (req, res, next) => {
+    try {
+      if (!mongoose.isValidObjectId(req.params.id)) return res.status(404).json({ error: 'Order not found' });
+      const { text, error } = normalizeOrderChatMessage(req.body?.message);
+      if (error) return res.status(400).json({ error });
+      const order = await Order.findByIdAndUpdate(
+        req.params.id,
+        { $push: { messages: { $each: [{ sender: 'admin', text, createdAt: new Date() }], $slice: -200 } } },
+        { new: true },
+      ).select('messages').lean();
+      if (!order) return res.status(404).json({ error: 'Order not found' });
+      res.status(201).json({ messages: order.messages || [] });
+    } catch (error) { next(error); }
+  });
   app.patch('/api/admin/orders/:id/status', async (req, res, next) => {
     try {
       const order = await Order.findByIdAndUpdate(req.params.id, { status: req.body.status }, { new: true, runValidators: true });

@@ -8,6 +8,7 @@ import Order from './models/Order.js';
 import { isR2Configured, uploadToR2, deleteFromR2 } from './storage.js';
 import { registerRoutes } from './routes.js';
 import { requireAdmin } from './auth.js';
+import { createOrderChatToken, hashOrderChatToken, normalizeOrderChatMessage } from './orderChat.js';
 
 const app = express();
 const isProduction = process.env.NODE_ENV === 'production';
@@ -45,7 +46,7 @@ app.get('/api/products', async (_req, res, next) => {
   } catch (error) { next(error); }
 });
 
-app.get('/api/orders', async (_req, res, next) => {
+app.get('/api/orders', requireAdmin, async (_req, res, next) => {
   try {
     if (mongoose.connection.readyState !== 1) return res.json([]);
     res.json(await Order.find().sort({ createdAt: -1 }).limit(20).lean());
@@ -69,6 +70,7 @@ app.post('/api/orders', async (req, res, next) => {
     const subtotal = items.reduce((sum, item) => sum + item.price * item.quantity, 0);
     const shipping = subtotal >= 150 ? 0 : 12.95;
     const total = Number((subtotal + shipping).toFixed(2));
+    const chatToken = createOrderChatToken();
     const order = await Order.create({
       customer: String(body.customer).trim().slice(0, 200),
       email: String(body.email).trim().slice(0, 200),
@@ -78,8 +80,48 @@ app.post('/api/orders', async (req, res, next) => {
       items,
       total,
       status: 'Processing',
+      chatTokenHash: hashOrderChatToken(chatToken),
     });
-    res.status(201).json(order);
+    const safeOrder = order.toObject();
+    delete safeOrder.chatTokenHash;
+    res.status(201).json({ ...safeOrder, chatToken });
+  } catch (error) { next(error); }
+});
+
+app.get('/api/orders/:id/messages', async (req, res, next) => {
+  try {
+    const token = (req.headers.authorization || '').startsWith('Bearer ')
+      ? req.headers.authorization.slice(7).trim()
+      : '';
+    if (!token || !mongoose.isValidObjectId(req.params.id)) {
+      return res.status(401).json({ error: 'Order chat authorization required' });
+    }
+    const order = await Order.findOne({
+      _id: req.params.id,
+      chatTokenHash: hashOrderChatToken(token),
+    }).select('messages').lean();
+    if (!order) return res.status(401).json({ error: 'Order chat authorization required' });
+    res.json({ messages: order.messages || [] });
+  } catch (error) { next(error); }
+});
+
+app.post('/api/orders/:id/messages', async (req, res, next) => {
+  try {
+    const token = (req.headers.authorization || '').startsWith('Bearer ')
+      ? req.headers.authorization.slice(7).trim()
+      : '';
+    if (!token || !mongoose.isValidObjectId(req.params.id)) {
+      return res.status(401).json({ error: 'Order chat authorization required' });
+    }
+    const { text, error } = normalizeOrderChatMessage(req.body?.message);
+    if (error) return res.status(400).json({ error });
+    const order = await Order.findOneAndUpdate(
+      { _id: req.params.id, chatTokenHash: hashOrderChatToken(token) },
+      { $push: { messages: { $each: [{ sender: 'customer', text, createdAt: new Date() }], $slice: -200 } } },
+      { new: true },
+    ).select('messages').lean();
+    if (!order) return res.status(401).json({ error: 'Order chat authorization required' });
+    res.status(201).json({ messages: order.messages || [] });
   } catch (error) { next(error); }
 });
 
