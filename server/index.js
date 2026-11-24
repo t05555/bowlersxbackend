@@ -1,14 +1,22 @@
-import 'dotenv/config';
+﻿import 'dotenv/config';
+import http from 'node:http';
 import express from 'express';
 import mongoose from 'mongoose';
 import cors from 'cors';
 import multer from 'multer';
 import Product from './models/Product.js';
 import Order from './models/Order.js';
-import { isR2Configured, uploadToR2, deleteFromR2 } from './storage.js';
+import { isR2Configured, uploadToR2 } from './storage.js';
 import { registerRoutes } from './routes.js';
 import { requireAdmin } from './auth.js';
 import { createOrderChatToken, hashOrderChatToken, normalizeOrderChatMessage } from './orderChat.js';
+import { createOrderChatSocket } from './orderChatSocket.js';
+import {
+  findOrderByCustomerToken,
+  getOrCreateConversationForOrder,
+  getConversationMessages,
+  createChatMessage,
+} from './orderChatService.js';
 
 const app = express();
 const isProduction = process.env.NODE_ENV === 'production';
@@ -16,16 +24,22 @@ const allowedOrigins = [
   'https://bowlersx.vercel.app',
   ...(process.env.CORS_ORIGIN || '').split(',').map((origin) => origin.trim()).filter(Boolean),
 ];
-app.use(cors({
+const corsOptions = {
   origin: allowedOrigins,
   methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
   allowedHeaders: ['Content-Type', 'Authorization'],
-}));
+  credentials: true,
+};
+app.use(cors(corsOptions));
 app.use(express.json({ limit: '1mb' }));
 const upload = multer({
   storage: multer.memoryStorage(),
   limits: { fileSize: 5 * 1024 * 1024 },
 });
+
+const httpServer = http.createServer(app);
+const io = createOrderChatSocket(httpServer, { origin: allowedOrigins, methods: ['GET', 'POST'], credentials: true });
+app.set('io', io);
 
 app.get('/api/health', (_req, res) => {
   const mongoDb = mongoose.connection.readyState === 1;
@@ -35,6 +49,7 @@ app.get('/api/health', (_req, res) => {
     status: healthy ? 'ok' : 'degraded',
     mongoDb,
     r2,
+    realtime: true,
   });
 });
 
@@ -53,6 +68,12 @@ app.get('/api/orders', requireAdmin, async (_req, res, next) => {
   } catch (error) { next(error); }
 });
 
+function normalizePaymentMethod(value) {
+  const allowed = ['manual', 'card', 'paypal', 'cashapp', 'chime', 'zelle'];
+  const v = String(value || 'manual').toLowerCase().trim();
+  return allowed.includes(v) ? v : 'manual';
+}
+
 app.post('/api/orders', async (req, res, next) => {
   try {
     if (mongoose.connection.readyState !== 1) return res.status(503).json({ error: 'MongoDB is not configured' });
@@ -68,7 +89,7 @@ app.post('/api/orders', async (req, res, next) => {
       weight: String(item.weight || '').slice(0, 20),
     }));
     const subtotal = items.reduce((sum, item) => sum + item.price * item.quantity, 0);
-    const shipping = subtotal >= 150 ? 0 : 12.95;
+    const shipping = String(body.shippingAddress?.country || '').trim().toLowerCase() === 'united states' ? 0 : (subtotal >= 150 ? 0 : 12.95);
     const total = Number((subtotal + shipping).toFixed(2));
     const chatToken = createOrderChatToken();
     const order = await Order.create({
@@ -76,32 +97,33 @@ app.post('/api/orders', async (req, res, next) => {
       email: String(body.email).trim().slice(0, 200),
       phone: String(body.phone || '').trim().slice(0, 50),
       shippingAddress: body.shippingAddress,
-      paymentMethod: 'manual',
+      paymentMethod: normalizePaymentMethod(body.paymentMethod),
       items,
       total,
       status: 'Processing',
       chatTokenHash: hashOrderChatToken(chatToken),
+      messages: [],
     });
+    // Pre-create conversation for order chat (best-effort)
+    try { await getOrCreateConversationForOrder(order._id); } catch { /* non-blocking */ }
     const safeOrder = order.toObject();
     delete safeOrder.chatTokenHash;
     res.status(201).json({ ...safeOrder, chatToken });
   } catch (error) { next(error); }
 });
 
+// Compatibility customer chat endpoints (token-auth) backed by Conversation/Message store
 app.get('/api/orders/:id/messages', async (req, res, next) => {
   try {
     const token = (req.headers.authorization || '').startsWith('Bearer ')
       ? req.headers.authorization.slice(7).trim()
       : '';
-    if (!token || !mongoose.isValidObjectId(req.params.id)) {
-      return res.status(401).json({ error: 'Order chat authorization required' });
-    }
-    const order = await Order.findOne({
-      _id: req.params.id,
-      chatTokenHash: hashOrderChatToken(token),
-    }).select('messages').lean();
+    const order = await findOrderByCustomerToken(req.params.id, token);
     if (!order) return res.status(401).json({ error: 'Order chat authorization required' });
-    res.json({ messages: order.messages || [] });
+    const result = await getOrCreateConversationForOrder(req.params.id);
+    if (result.error) return res.status(result.status || 404).json({ error: result.error });
+    const messages = await getConversationMessages(result.conversation._id);
+    res.json({ messages: messages.map((m) => ({ sender: m.senderRole, text: m.message, createdAt: m.createdAt, _id: m._id, read: m.read })) });
   } catch (error) { next(error); }
 });
 
@@ -110,22 +132,31 @@ app.post('/api/orders/:id/messages', async (req, res, next) => {
     const token = (req.headers.authorization || '').startsWith('Bearer ')
       ? req.headers.authorization.slice(7).trim()
       : '';
-    if (!token || !mongoose.isValidObjectId(req.params.id)) {
-      return res.status(401).json({ error: 'Order chat authorization required' });
-    }
-    const { text, error } = normalizeOrderChatMessage(req.body?.message);
-    if (error) return res.status(400).json({ error });
-    const order = await Order.findOneAndUpdate(
-      { _id: req.params.id, chatTokenHash: hashOrderChatToken(token) },
-      { $push: { messages: { $each: [{ sender: 'customer', text, createdAt: new Date() }], $slice: -200 } } },
-      { new: true },
-    ).select('messages').lean();
+    const order = await findOrderByCustomerToken(req.params.id, token);
     if (!order) return res.status(401).json({ error: 'Order chat authorization required' });
-    res.status(201).json({ messages: order.messages || [] });
+    const normalized = normalizeOrderChatMessage(req.body?.message);
+    if (normalized.error) return res.status(400).json({ error: normalized.error });
+    const result = await getOrCreateConversationForOrder(req.params.id);
+    if (result.error) return res.status(result.status || 404).json({ error: result.error });
+    const created = await createChatMessage({
+      conversationId: result.conversation._id,
+      senderId: order.email || String(order._id),
+      senderRole: 'customer',
+      message: normalized.text,
+    });
+    if (created.error) return res.status(created.status || 400).json({ error: created.error });
+    const messages = await getConversationMessages(result.conversation._id);
+    io.to(`conversation:${String(result.conversation._id)}`).emit('chat:new-message', {
+      conversationId: String(result.conversation._id),
+      orderId: String(order._id),
+      message: created.message,
+    });
+    io.emit('chat:conversation-updated', { conversationId: String(result.conversation._id), orderId: String(order._id) });
+    res.status(201).json({ messages: messages.map((m) => ({ sender: m.senderRole, text: m.message, createdAt: m.createdAt, _id: m._id, read: m.read })) });
   } catch (error) { next(error); }
 });
 
-app.get('/api/admin/stats', async (_req, res, next) => {
+app.get('/api/admin/stats', requireAdmin, async (_req, res, next) => {
   try {
     if (mongoose.connection.readyState !== 1) {
       return res.json({ productCount: 0, orderCount: 0, revenue: 0 });
@@ -139,7 +170,7 @@ app.get('/api/admin/stats', async (_req, res, next) => {
   } catch (error) { next(error); }
 });
 
-app.post('/api/uploads/products', upload.single('image'), async (req, res, next) => {
+app.post('/api/uploads/products', requireAdmin, upload.single('image'), async (req, res, next) => {
   try {
     if (!isR2Configured()) {
       return res.status(503).json({ error: 'Cloudflare R2 is not configured' });
@@ -209,7 +240,7 @@ async function start() {
 
   if (!process.env.MONGODB_URI) {
     console.warn('MongoDB Atlas is not configured. The site is running with demo product data.');
-    app.listen(port, '0.0.0.0', () => console.log(`API server listening on port ${port}`));
+    httpServer.listen(port, '0.0.0.0', () => console.log(`API server listening on port ${port}`));
     return;
   }
 
@@ -219,7 +250,7 @@ async function start() {
   } catch (error) {
     console.error('MongoDB connection failed:', error.name);
     if (isProduction) throw error;
-    app.listen(port, '0.0.0.0', () => console.log(`API server listening on port ${port}`));
+    httpServer.listen(port, '0.0.0.0', () => console.log(`API server listening on port ${port}`));
     return;
   }
 
@@ -244,7 +275,7 @@ async function start() {
     }
   }
 
-  app.listen(port, '0.0.0.0', () => console.log(`API server listening on port ${port}`));
+  httpServer.listen(port, '0.0.0.0', () => console.log(`API server listening on port ${port}`));
 }
 
 registerRoutes(app);

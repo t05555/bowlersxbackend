@@ -14,6 +14,23 @@ import { isR2Configured, uploadToR2, deleteFromR2 } from './storage.js';
 import { normalizeOrderChatMessage } from './orderChat.js';
 import { normalizeWeightPrices } from './productInput.js';
 import { z } from 'zod';
+import rateLimit from 'express-rate-limit';
+import Conversation from './models/Conversation.js';
+import Message from './models/Message.js';
+import {
+  findOrderByCustomerToken,
+  findOrderById,
+  getOrCreateConversationForOrder,
+  serializeConversation,
+  getConversationMessages,
+  createChatMessage,
+  markConversationRead,
+  getAdminConversations,
+  getUnreadSummary,
+  getConversationWithOrder,
+  getConversationById,
+  isValidObjectId,
+} from './orderChatService.js';
 
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 5 * 1024 * 1024 } });
 const slugify = (value) => String(value || '').toLowerCase().trim().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '');
@@ -338,9 +355,10 @@ export function registerRoutes(app) {
   app.get('/api/admin/orders/:id/messages', async (req, res, next) => {
     try {
       if (!mongoose.isValidObjectId(req.params.id)) return res.status(404).json({ error: 'Order not found' });
-      const order = await Order.findById(req.params.id).select('messages').lean();
-      if (!order) return res.status(404).json({ error: 'Order not found' });
-      res.json({ messages: order.messages || [] });
+      const result = await getOrCreateConversationForOrder(req.params.id);
+      if (result.error) return res.status(result.status || 404).json({ error: result.error });
+      const messages = await getConversationMessages(result.conversation._id);
+      res.json({ messages: messages.map((m) => ({ sender: m.senderRole, text: m.message, createdAt: m.createdAt, _id: m._id, read: m.read })), conversationId: String(result.conversation._id) });
     } catch (error) { next(error); }
   });
   app.post('/api/admin/orders/:id/messages', async (req, res, next) => {
@@ -348,13 +366,22 @@ export function registerRoutes(app) {
       if (!mongoose.isValidObjectId(req.params.id)) return res.status(404).json({ error: 'Order not found' });
       const { text, error } = normalizeOrderChatMessage(req.body?.message);
       if (error) return res.status(400).json({ error });
-      const order = await Order.findByIdAndUpdate(
-        req.params.id,
-        { $push: { messages: { $each: [{ sender: 'admin', text, createdAt: new Date() }], $slice: -200 } } },
-        { new: true },
-      ).select('messages').lean();
-      if (!order) return res.status(404).json({ error: 'Order not found' });
-      res.status(201).json({ messages: order.messages || [] });
+      const result = await getOrCreateConversationForOrder(req.params.id);
+      if (result.error) return res.status(result.status || 404).json({ error: result.error });
+      const created = await createChatMessage({
+        conversationId: result.conversation._id,
+        senderId: req.admin?.username || 'admin',
+        senderRole: 'admin',
+        message: text,
+      });
+      if (created.error) return res.status(created.status || 400).json({ error: created.error });
+      const io = req.app.get('io');
+      if (io) {
+        io.to(`conversation:${String(result.conversation._id)}`).emit('chat:new-message', { conversationId: String(result.conversation._id), orderId: String(req.params.id), message: created.message });
+        io.emit('chat:conversation-updated', { conversationId: String(result.conversation._id), orderId: String(req.params.id) });
+      }
+      const messages = await getConversationMessages(result.conversation._id);
+      res.status(201).json({ messages: messages.map((m) => ({ sender: m.senderRole, text: m.message, createdAt: m.createdAt, _id: m._id, read: m.read })), conversationId: String(result.conversation._id) });
     } catch (error) { next(error); }
   });
   app.patch('/api/admin/orders/:id/status', async (req, res, next) => {
@@ -410,6 +437,127 @@ export function registerRoutes(app) {
         device,
       });
       res.status(201).json({ recorded: true });
+    } catch (error) { next(error); }
+  });
+
+  const orderChatLimiter = rateLimit({ windowMs: 60 * 1000, limit: 120, standardHeaders: 'draft-7', legacyHeaders: false });
+  const orderChatSendLimiter = rateLimit({ windowMs: 60 * 1000, limit: 40, standardHeaders: 'draft-7', legacyHeaders: false });
+
+  function getBearerToken(req) {
+    const header = req.headers.authorization || '';
+    return header.startsWith('Bearer ') ? header.slice(7).trim() : '';
+  }
+
+  function verifyAdminToken(token) {
+    if (!token || !process.env.JWT_SECRET) return null;
+    try {
+      const payload = jwt.verify(token, process.env.JWT_SECRET);
+      return payload?.role === 'admin' ? payload : null;
+    } catch {
+      return null;
+    }
+  }
+
+  async function authorizeOrderChatAccess(req, orderId) {
+    const token = getBearerToken(req);
+    const admin = verifyAdminToken(token);
+    if (admin) {
+      const order = await findOrderById(orderId);
+      return order ? { role: 'admin', admin, order, senderId: admin.username || 'admin' } : null;
+    }
+    const order = await findOrderByCustomerToken(orderId, token);
+    if (!order) return null;
+    return { role: 'customer', order, senderId: order.email || String(order._id) };
+  }
+
+  async function authorizeConversationAccess(req, conversationId) {
+    const token = getBearerToken(req);
+    const admin = verifyAdminToken(token);
+    const conversation = await getConversationWithOrder(conversationId);
+    if (!conversation) return null;
+    const orderId = String(conversation.orderId?._id || conversation.orderId);
+    if (admin) {
+      return { role: 'admin', admin, conversation, orderId, senderId: admin.username || 'admin' };
+    }
+    const order = await findOrderByCustomerToken(orderId, token);
+    if (!order) return null;
+    return { role: 'customer', conversation, orderId, senderId: order.email || orderId };
+  }
+
+  function orderChatOrderSummary(order) {
+    if (!order) return null;
+    return {
+      _id: String(order._id),
+      customer: order.customer || '',
+      email: order.email || '',
+      phone: order.phone || '',
+      total: order.total ?? 0,
+      status: order.status || '',
+      items: Array.isArray(order.items) ? order.items : [],
+      createdAt: order.createdAt || null,
+      shippingAddress: order.shippingAddress || null,
+      paymentMethod: order.paymentMethod || '',
+    };
+  }
+
+  app.post('/api/order-chat/:orderId', orderChatLimiter, async (req, res, next) => {
+    try {
+      const access = await authorizeOrderChatAccess(req, req.params.orderId);
+      if (!access) return res.status(401).json({ error: 'Order chat authorization required' });
+      const result = await getOrCreateConversationForOrder(req.params.orderId);
+      if (result.error) return res.status(result.status || 404).json({ error: result.error });
+      const messages = await getConversationMessages(result.conversation._id);
+      res.json({
+        conversation: serializeConversation(result.conversation, orderChatOrderSummary(result.order)),
+        messages,
+        role: access.role,
+      });
+    } catch (error) { next(error); }
+  });
+
+  app.get('/api/order-chat/:orderId/messages', orderChatLimiter, async (req, res, next) => {
+    try {
+      const access = await authorizeOrderChatAccess(req, req.params.orderId);
+      if (!access) return res.status(401).json({ error: 'Order chat authorization required' });
+      const result = await getOrCreateConversationForOrder(req.params.orderId);
+      if (result.error) return res.status(result.status || 404).json({ error: result.error });
+      const messages = await getConversationMessages(result.conversation._id, { limit: req.query.limit, before: req.query.before });
+      res.json({ conversationId: String(result.conversation._id), messages });
+    } catch (error) { next(error); }
+  });
+
+  app.get('/api/admin/order-chats', async (req, res, next) => {
+    try {
+      const data = await getAdminConversations({ page: req.query.page, limit: req.query.limit, search: req.query.search || req.query.q || '' });
+      res.json(data);
+    } catch (error) { next(error); }
+  });
+
+  app.get('/api/admin/order-chats/unread', async (_req, res, next) => {
+    try {
+      res.json(await getUnreadSummary());
+    } catch (error) { next(error); }
+  });
+
+  app.patch('/api/order-chat/:conversationId/read', orderChatLimiter, async (req, res, next) => {
+    try {
+      const access = await authorizeConversationAccess(req, req.params.conversationId);
+      if (!access) return res.status(401).json({ error: 'Conversation authorization required' });
+      const result = await markConversationRead(req.params.conversationId, access.role);
+      if (result.error) return res.status(result.status || 404).json({ error: result.error });
+      res.json(result);
+    } catch (error) { next(error); }
+  });
+
+  // Compatibility: keep legacy embedded-message endpoints backed by Conversation/Message store
+  app.get('/api/orders/:orderId/messages-compat', orderChatLimiter, async (req, res, next) => {
+    try {
+      const access = await authorizeOrderChatAccess(req, req.params.orderId);
+      if (!access) return res.status(401).json({ error: 'Order chat authorization required' });
+      const result = await getOrCreateConversationForOrder(req.params.orderId);
+      if (result.error) return res.status(result.status || 404).json({ error: result.error });
+      const messages = await getConversationMessages(result.conversation._id);
+      res.json({ messages: messages.map((m) => ({ sender: m.senderRole, text: m.message, createdAt: m.createdAt })) });
     } catch (error) { next(error); }
   });
 }

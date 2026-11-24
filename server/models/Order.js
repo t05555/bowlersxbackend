@@ -8,7 +8,7 @@ const orderSchema = new mongoose.Schema({
     firstName: String, lastName: String, company: String, address: String,
     apartment: String, city: String, state: String, zip: String, country: String,
   },
-  paymentMethod: { type: String, enum: ['manual', 'card', 'paypal'], default: 'manual' },
+  paymentMethod: { type: String, enum: ['manual', 'card', 'paypal', 'cashapp', 'chime', 'zelle'], default: 'manual' },
   items: [{
     product: { type: mongoose.Schema.Types.ObjectId, ref: 'Product' },
     name: String,
